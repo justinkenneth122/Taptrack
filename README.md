@@ -7,7 +7,6 @@
 
 **Key Features:**
 - ✅ Student registration and login with FEU email validation
-- ✅ Face recognition registration for secure identification
 - ✅ QR code generation and scanning for attendance tracking
 - ✅ Event management (create, archive, view)
 - ✅ Attendance analytics and reporting
