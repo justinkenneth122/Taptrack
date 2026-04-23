@@ -1,0 +1,1695 @@
+<?php
+/**
+ * ============================================================
+ * TAPTRACK — QR Code Attendance System (Full PHP Version)
+ * FEU Roosevelt Marikina
+ * ============================================================
+ *
+ * SETUP INSTRUCTIONS:
+ * 1. Create a MySQL database called `taptrack`
+ * 2. Run the SQL at the bottom of this file (or visit ?page=install)
+ * 3. Place this file on any PHP server (XAMPP, WAMP, hosting, etc.)
+ * 4. Access it via browser: http://localhost/taptrack-php/index.php
+ *
+ * REQUIREMENTS: PHP 7.4+, MySQL/MariaDB, PDO extension
+ * 
+ * This is a SINGLE-FILE application. All pages, styles, and logic
+ * are contained here for easy copy-paste deployment.
+ * ============================================================
+ */
+
+// ======================== CONFIG ========================
+$DB_HOST = 'localhost';
+$DB_NAME = 'taptrack';
+$DB_USER = 'root';
+$DB_PASS = '';
+
+$ADMIN_USER = 'admin';
+$ADMIN_PASS = 'admin123';
+
+// ======================== DATABASE ========================
+try {
+    $pdo = new PDO("mysql:host=$DB_HOST;dbname=$DB_NAME;charset=utf8mb4", $DB_USER, $DB_PASS, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    ]);
+} catch (PDOException $e) {
+    if (strpos($e->getMessage(), 'Unknown database') !== false) {
+        showInstallPage($DB_HOST, $DB_NAME, $DB_USER, $DB_PASS);
+        exit;
+    }
+    die("Database connection failed: " . $e->getMessage());
+}
+
+session_start();
+
+// ======================== ROUTING ========================
+$page = $_GET['page'] ?? 'login';
+$action = $_POST['action'] ?? '';
+
+// Handle POST actions
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    handleAction($pdo, $action);
+}
+
+// Handle AJAX requests
+if (isset($_GET['ajax'])) {
+    header('Content-Type: application/json');
+    handleAjax($pdo, $_GET['ajax']);
+    exit;
+}
+
+// ======================== ACTION HANDLER ========================
+function handleAction($pdo, $action) {
+    global $ADMIN_USER, $ADMIN_PASS;
+
+    switch ($action) {
+        case 'student_login':
+            $email = trim($_POST['email'] ?? '');
+            $password = $_POST['password'] ?? '';
+            if (!preg_match('/^R\d{8,}@feuroosevelt\.edu\.ph$/i', $email)) {
+                $_SESSION['flash'] = ['type' => 'error', 'msg' => 'Invalid email format. Use R[Number]@feuroosevelt.edu.ph'];
+                break;
+            }
+            $stmt = $pdo->prepare("SELECT * FROM students WHERE email = ?");
+            $stmt->execute([$email]);
+            $student = $stmt->fetch();
+            if (!$student) {
+                $_SESSION['flash'] = ['type' => 'error', 'msg' => 'No account found. Please register first.'];
+                break;
+            }
+            if ($student['password'] !== $password) {
+                $_SESSION['flash'] = ['type' => 'error', 'msg' => 'Wrong password.'];
+                break;
+            }
+            $_SESSION['user_id'] = $student['id'];
+            $_SESSION['user_role'] = 'student';
+            $_SESSION['user_name'] = $student['first_name'] . ' ' . $student['last_name'];
+            header('Location: ?page=student');
+            exit;
+
+        case 'student_register':
+            $email = trim($_POST['email'] ?? '');
+            $password = $_POST['password'] ?? '';
+            $first_name = trim($_POST['first_name'] ?? '');
+            $last_name = trim($_POST['last_name'] ?? '');
+            $course = $_POST['course'] ?? '';
+            $year_level = $_POST['year_level'] ?? '';
+
+            if (!preg_match('/^R\d{8,}@feuroosevelt\.edu\.ph$/i', $email)) {
+                $_SESSION['flash'] = ['type' => 'error', 'msg' => 'Invalid email format.'];
+                break;
+            }
+            if (!$first_name || !$last_name || !$course || !$year_level || !$password) {
+                $_SESSION['flash'] = ['type' => 'error', 'msg' => 'Please fill in all fields.'];
+                break;
+            }
+            $stmt = $pdo->prepare("SELECT id FROM students WHERE email = ?");
+            $stmt->execute([$email]);
+            if ($stmt->fetch()) {
+                $_SESSION['flash'] = ['type' => 'error', 'msg' => 'Email already registered. Please log in.'];
+                break;
+            }
+            $student_number = explode('@', $email)[0];
+            $id = generateUUID();
+            $stmt = $pdo->prepare("INSERT INTO students (id, email, first_name, last_name, student_number, course, year_level, password) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+            $stmt->execute([$id, $email, $first_name, $last_name, $student_number, $course, $year_level, $password]);
+            // Go to face registration step
+            $_SESSION['face_reg_student_id'] = $id;
+            $_SESSION['user_name'] = "$first_name $last_name";
+            $_SESSION['flash'] = ['type' => 'success', 'msg' => 'Account created! Now register your face to complete setup.'];
+            header('Location: ?page=face_register');
+            exit;
+
+        case 'skip_face_reg':
+            $student_id = $_SESSION['face_reg_student_id'] ?? '';
+            if ($student_id) {
+                $_SESSION['user_id'] = $student_id;
+                $_SESSION['user_role'] = 'student';
+                unset($_SESSION['face_reg_student_id']);
+                header('Location: ?page=student');
+                exit;
+            }
+            header('Location: ?page=login');
+            exit;
+
+        case 'admin_login':
+            $user = $_POST['username'] ?? '';
+            $pass = $_POST['password'] ?? '';
+            if ($user === $ADMIN_USER && $pass === $ADMIN_PASS) {
+                $_SESSION['user_id'] = 'admin-1';
+                $_SESSION['user_role'] = 'admin';
+                $_SESSION['user_name'] = 'Admin';
+                header('Location: ?page=admin');
+                exit;
+            }
+            $_SESSION['flash'] = ['type' => 'error', 'msg' => 'Invalid credentials. Use admin / admin123'];
+            break;
+
+        case 'logout':
+            session_destroy();
+            header('Location: ?page=login');
+            exit;
+
+        case 'add_event':
+            requireAdmin();
+            $name = trim($_POST['name'] ?? '');
+            $date = $_POST['date'] ?? '';
+            $location = trim($_POST['location'] ?? '');
+            $description = trim($_POST['description'] ?? '') ?: null;
+            if (!$name || !$date || !$location) {
+                $_SESSION['flash'] = ['type' => 'error', 'msg' => 'Please fill in name, date, and location.'];
+                header('Location: ?page=admin_events');
+                exit;
+            }
+            $id = generateUUID();
+            $stmt = $pdo->prepare("INSERT INTO events (id, name, date, location, description, archived) VALUES (?, ?, ?, ?, ?, 0)");
+            $stmt->execute([$id, $name, $date, $location, $description]);
+            $_SESSION['flash'] = ['type' => 'success', 'msg' => "Event \"$name\" created."];
+            header('Location: ?page=admin_events');
+            exit;
+
+        case 'archive_event':
+            requireAdmin();
+            $id = $_POST['event_id'] ?? '';
+            $pdo->prepare("UPDATE events SET archived = 1 WHERE id = ?")->execute([$id]);
+            $_SESSION['flash'] = ['type' => 'success', 'msg' => 'Event archived.'];
+            header('Location: ?page=admin_events');
+            exit;
+
+        case 'record_attendance':
+            requireAdmin();
+            $student_id = $_POST['student_id'] ?? '';
+            $event_id = $_POST['event_id'] ?? '';
+            $stmt = $pdo->prepare("SELECT id FROM attendance WHERE student_id = ? AND event_id = ?");
+            $stmt->execute([$student_id, $event_id]);
+            if ($stmt->fetch()) {
+                echo json_encode(['success' => false, 'message' => 'Already recorded']);
+                exit;
+            }
+            $id = generateUUID();
+            $pdo->prepare("INSERT INTO attendance (id, student_id, event_id) VALUES (?, ?, ?)")->execute([$id, $student_id, $event_id]);
+            $stmt = $pdo->prepare("SELECT first_name, last_name FROM students WHERE id = ?");
+            $stmt->execute([$student_id]);
+            $stu = $stmt->fetch();
+            echo json_encode(['success' => true, 'message' => ($stu ? $stu['first_name'] . ' ' . $stu['last_name'] : 'Student') . ' — Attendance recorded!']);
+            exit;
+    }
+}
+
+// ======================== AJAX HANDLER ========================
+function handleAjax($pdo, $type) {
+    switch ($type) {
+        case 'scan_qr':
+            $data = json_decode(file_get_contents('php://input'), true);
+            if (!$data || ($data['system'] ?? '') !== 'taptrack') {
+                echo json_encode(['success' => false, 'message' => 'Invalid QR code — not a Taptrack code.']);
+                return;
+            }
+            $student_id = $data['studentId'] ?? '';
+            $event_id = $data['eventId'] ?? '';
+            $stmt = $pdo->prepare("SELECT * FROM students WHERE id = ?");
+            $stmt->execute([$student_id]);
+            $student = $stmt->fetch();
+            if (!$student) {
+                echo json_encode(['success' => false, 'message' => 'Student not found.']);
+                return;
+            }
+            $stmt = $pdo->prepare("SELECT id FROM attendance WHERE student_id = ? AND event_id = ?");
+            $stmt->execute([$student_id, $event_id]);
+            if ($stmt->fetch()) {
+                echo json_encode(['success' => false, 'message' => $student['first_name'] . ' ' . $student['last_name'] . ' — Already recorded.']);
+                return;
+            }
+            $id = generateUUID();
+            $pdo->prepare("INSERT INTO attendance (id, student_id, event_id) VALUES (?, ?, ?)")->execute([$id, $student_id, $event_id]);
+            echo json_encode(['success' => true, 'message' => '✓ ' . $student['first_name'] . ' ' . $student['last_name'] . ' — Attendance recorded!']);
+            return;
+
+        case 'save_face_descriptor':
+            $data = json_decode(file_get_contents('php://input'), true);
+            $student_id = $data['student_id'] ?? '';
+            $descriptor = $data['face_descriptor'] ?? '';
+            if (!$student_id || !$descriptor) {
+                echo json_encode(['success' => false, 'message' => 'Missing data.']);
+                return;
+            }
+            $stmt = $pdo->prepare("UPDATE students SET face_descriptor = ? WHERE id = ?");
+            $stmt->execute([$descriptor, $student_id]);
+            echo json_encode(['success' => true, 'message' => 'Face registered successfully.']);
+            return;
+
+        case 'get_students':
+            $stmt = $pdo->query("SELECT id, first_name, last_name, student_number FROM students ORDER BY created_at");
+            echo json_encode($stmt->fetchAll());
+            return;
+
+        case 'get_face_descriptor':
+            $student_id = $_GET['student_id'] ?? '';
+            if (!$student_id) {
+                echo json_encode(['success' => false, 'message' => 'Missing student ID.']);
+                return;
+            }
+            $stmt = $pdo->prepare("SELECT face_descriptor FROM students WHERE id = ?");
+            $stmt->execute([$student_id]);
+            $row = $stmt->fetch();
+            echo json_encode(['success' => true, 'face_descriptor' => $row['face_descriptor'] ?? null]);
+            return;
+    }
+}
+
+// ======================== HELPERS ========================
+function generateUUID() {
+    return sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
+        mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff),
+        mt_rand(0, 0x0fff) | 0x4000, mt_rand(0, 0x3fff) | 0x8000,
+        mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff));
+}
+
+function requireAdmin() {
+    if (($_SESSION['user_role'] ?? '') !== 'admin') {
+        header('Location: ?page=login');
+        exit;
+    }
+}
+
+function requireStudent() {
+    if (($_SESSION['user_role'] ?? '') !== 'student') {
+        header('Location: ?page=login');
+        exit;
+    }
+}
+
+function e($str) { return htmlspecialchars($str ?? '', ENT_QUOTES, 'UTF-8'); }
+
+function getFlash() {
+    $flash = $_SESSION['flash'] ?? null;
+    unset($_SESSION['flash']);
+    return $flash;
+}
+
+$COURSES = [
+    "BS Information Technology", "BS Computer Science", "BS Accountancy",
+    "BS Business Administration", "BS Psychology", "BS Nursing",
+    "BS Pharmacy", "BS Medical Technology", "BS Education", "BS Criminology",
+];
+$YEAR_LEVELS = ["1st Year", "2nd Year", "3rd Year", "4th Year", "5th Year"];
+
+// ======================== INSTALL PAGE ========================
+function showInstallPage($host, $dbname, $user, $pass) {
+    ?><!DOCTYPE html><html><head><title>Taptrack Install</title></head><body style="font-family:sans-serif;max-width:700px;margin:40px auto;padding:20px;">
+    <h1>Taptrack — Database Setup Required</h1>
+    <p>Create a MySQL database called <code><?= $dbname ?></code> and run this SQL:</p>
+    <pre style="background:#f5f5f5;padding:15px;border-radius:8px;overflow:auto;font-size:13px;"><?= e(getInstallSQL()) ?></pre>
+    <p>Then refresh this page.</p></body></html><?php
+}
+
+function getInstallSQL() {
+    return <<<'SQL'
+CREATE DATABASE IF NOT EXISTS taptrack CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE taptrack;
+
+CREATE TABLE students (
+    id VARCHAR(36) PRIMARY KEY,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    first_name VARCHAR(100) NOT NULL,
+    last_name VARCHAR(100) NOT NULL,
+    student_number VARCHAR(50) NOT NULL,
+    course VARCHAR(100) NOT NULL,
+    year_level VARCHAR(20) DEFAULT '1st Year',
+    password VARCHAR(255) DEFAULT '',
+    face_descriptor LONGTEXT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE events (
+    id VARCHAR(36) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    date DATE NOT NULL,
+    location VARCHAR(255) NOT NULL,
+    description TEXT,
+    archived TINYINT(1) DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE attendance (
+    id VARCHAR(36) PRIMARY KEY,
+    student_id VARCHAR(36) NOT NULL,
+    event_id VARCHAR(36) NOT NULL,
+    scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    scanned_out_at TIMESTAMP NULL DEFAULT NULL,
+    FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+    UNIQUE KEY unique_attendance (student_id, event_id)
+);
+SQL;
+}
+
+// ======================== PAGE ROUTING ========================
+// Auth guards
+if (in_array($page, ['student']) && ($_SESSION['user_role'] ?? '') !== 'student') {
+    header('Location: ?page=login'); exit;
+}
+if ($page === 'face_register' && empty($_SESSION['face_reg_student_id'])) {
+    header('Location: ?page=login'); exit;
+}
+if (in_array($page, ['admin', 'admin_events', 'admin_qr_generator', 'admin_qr_scanner', 'admin_attendance', 'admin_archived']) && ($_SESSION['user_role'] ?? '') !== 'admin') {
+    header('Location: ?page=login'); exit;
+}
+
+// Get data for current page
+$flash = getFlash();
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Taptrack — QR Attendance System</title>
+    <meta name="description" content="QR Code Attendance System for FEU Roosevelt Marikina">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --background: hsl(100, 10%, 97%);
+            --foreground: hsl(150, 30%, 10%);
+            --card: hsl(0, 0%, 100%);
+            --card-foreground: hsl(150, 30%, 10%);
+            --primary: hsl(152, 60%, 22%);
+            --primary-foreground: hsl(50, 100%, 95%);
+            --secondary: hsl(45, 90%, 55%);
+            --secondary-foreground: hsl(150, 30%, 10%);
+            --muted: hsl(100, 10%, 93%);
+            --muted-foreground: hsl(150, 10%, 45%);
+            --accent: hsl(45, 90%, 55%);
+            --destructive: hsl(0, 72%, 51%);
+            --destructive-foreground: hsl(0, 0%, 100%);
+            --border: hsl(150, 15%, 85%);
+            --input: hsl(150, 15%, 85%);
+            --ring: hsl(152, 60%, 22%);
+            --radius: 0.625rem;
+            --success: hsl(152, 60%, 40%);
+            --success-foreground: #fff;
+            --gold: hsl(45, 90%, 55%);
+            --sidebar-bg: hsl(152, 60%, 18%);
+            --sidebar-fg: hsl(100, 20%, 90%);
+            --sidebar-primary: hsl(45, 90%, 55%);
+            --sidebar-accent: hsl(152, 50%, 25%);
+            --sidebar-accent-fg: hsl(100, 20%, 95%);
+            --sidebar-border: hsl(152, 40%, 28%);
+        }
+
+        body {
+            font-family: 'Inter', system-ui, sans-serif;
+            background: var(--background);
+            color: var(--foreground);
+            -webkit-font-smoothing: antialiased;
+            min-height: 100vh;
+        }
+
+        a { color: inherit; text-decoration: none; }
+
+        /* ---- Utility Classes ---- */
+        .flex { display: flex; }
+        .flex-col { flex-direction: column; }
+        .items-center { align-items: center; }
+        .justify-center { justify-content: center; }
+        .justify-between { justify-content: space-between; }
+        .gap-1 { gap: 0.25rem; }
+        .gap-2 { gap: 0.5rem; }
+        .gap-3 { gap: 0.75rem; }
+        .gap-4 { gap: 1rem; }
+        .text-center { text-align: center; }
+        .text-right { text-align: right; }
+        .text-sm { font-size: 0.875rem; }
+        .text-xs { font-size: 0.75rem; }
+        .font-bold { font-weight: 700; }
+        .font-extrabold { font-weight: 800; }
+        .font-medium { font-weight: 500; }
+        .w-full { width: 100%; }
+        .max-w-md { max-width: 28rem; }
+        .max-w-lg { max-width: 32rem; }
+        .max-w-3xl { max-width: 48rem; }
+        .max-w-4xl { max-width: 56rem; }
+        .mx-auto { margin-left: auto; margin-right: auto; }
+        .mb-2 { margin-bottom: 0.5rem; }
+        .mb-3 { margin-bottom: 0.75rem; }
+        .mb-4 { margin-bottom: 1rem; }
+        .mb-8 { margin-bottom: 2rem; }
+        .mt-2 { margin-top: 0.5rem; }
+        .mt-4 { margin-top: 1rem; }
+        .mr-2 { margin-right: 0.5rem; }
+        .p-3 { padding: 0.75rem; }
+        .p-4 { padding: 1rem; }
+        .p-6 { padding: 1.5rem; }
+        .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
+        .py-12 { padding-top: 3rem; padding-bottom: 3rem; }
+        .px-4 { padding-left: 1rem; padding-right: 1rem; }
+        .space-y-3 > * + * { margin-top: 0.75rem; }
+        .space-y-4 > * + * { margin-top: 1rem; }
+        .space-y-5 > * + * { margin-top: 1.25rem; }
+        .space-y-6 > * + * { margin-top: 1.5rem; }
+        .shrink-0 { flex-shrink: 0; }
+        .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .hidden { display: none; }
+        .grid { display: grid; }
+        .grid-cols-2 { grid-template-columns: repeat(2, 1fr); }
+        .overflow-auto { overflow: auto; }
+
+        /* ---- Card ---- */
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+        .card-header { padding: 1.25rem 1.5rem 0.5rem; }
+        .card-content { padding: 0 1.5rem 1.5rem; }
+        .card-title { font-size: 1rem; font-weight: 600; color: var(--foreground); }
+        .card-desc { font-size: 0.875rem; color: var(--muted-foreground); }
+
+        /* ---- Button ---- */
+        .btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            padding: 0.5rem 1rem; border-radius: var(--radius); font-size: 0.875rem;
+            font-weight: 500; border: none; cursor: pointer; transition: all 0.15s;
+            text-decoration: none; line-height: 1.5;
+        }
+        .btn-primary { background: var(--primary); color: var(--primary-foreground); }
+        .btn-primary:hover { opacity: 0.9; }
+        .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--foreground); }
+        .btn-outline:hover { background: var(--muted); }
+        .btn-destructive { background: var(--destructive); color: var(--destructive-foreground); }
+        .btn-ghost { background: transparent; color: var(--muted-foreground); }
+        .btn-ghost:hover { background: var(--muted); color: var(--foreground); }
+        .btn-sm { padding: 0.25rem 0.75rem; font-size: 0.8rem; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-active { background: var(--primary); color: var(--primary-foreground); }
+        .flex-1 { flex: 1; }
+
+        /* ---- Form ---- */
+        .label { display: block; font-size: 0.875rem; font-weight: 500; margin-bottom: 0.25rem; color: var(--foreground); }
+        .input, .select, .textarea {
+            width: 100%; padding: 0.5rem 0.75rem; border: 1px solid var(--input);
+            border-radius: var(--radius); font-size: 0.875rem; background: var(--card);
+            color: var(--foreground); outline: none; font-family: inherit;
+        }
+        .input:focus, .select:focus, .textarea:focus { border-color: var(--ring); box-shadow: 0 0 0 2px hsl(152 60% 22% / 0.15); }
+        .textarea { min-height: 80px; resize: vertical; }
+
+        /* ---- Badge ---- */
+        .badge {
+            display: inline-flex; align-items: center; gap: 0.25rem;
+            padding: 0.2rem 0.6rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500;
+        }
+        .badge-success { background: hsl(152 60% 40% / 0.15); color: var(--success); }
+        .badge-secondary { background: var(--muted); color: var(--muted-foreground); }
+
+        /* ---- Table ---- */
+        .table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+        .table th { text-align: left; padding: 0.75rem; color: var(--muted-foreground); font-weight: 500; border-bottom: 1px solid var(--border); }
+        .table td { padding: 0.75rem; border-bottom: 1px solid var(--border); }
+        .table tr:last-child td { border-bottom: none; }
+        .font-mono { font-family: monospace; }
+
+        /* ---- Tabs ---- */
+        .tabs-list {
+            display: grid; grid-template-columns: 1fr 1fr;
+            background: var(--muted); border-radius: var(--radius); padding: 0.25rem; gap: 0.25rem;
+        }
+        .tab-trigger {
+            padding: 0.5rem; border-radius: calc(var(--radius) - 2px); font-size: 0.875rem;
+            font-weight: 500; border: none; cursor: pointer; background: transparent;
+            color: var(--muted-foreground); display: flex; align-items: center; justify-content: center; gap: 0.375rem;
+        }
+        .tab-trigger.active { background: var(--card); color: var(--foreground); box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+
+        /* ---- Toast/Flash ---- */
+        .flash {
+            padding: 0.75rem 1rem; border-radius: var(--radius); margin-bottom: 1rem;
+            font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem;
+        }
+        .flash-error { background: hsl(0 72% 51% / 0.1); border: 1px solid hsl(0 72% 51% / 0.2); color: var(--destructive); }
+        .flash-success { background: hsl(152 60% 40% / 0.1); border: 1px solid hsl(152 60% 40% / 0.2); color: var(--success); }
+
+        /* ---- Layout ---- */
+        .login-wrapper { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 1rem; }
+        .shadow-lg { box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1); }
+        .shadow-xl { box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1); }
+
+        .admin-layout { display: flex; min-height: 100vh; }
+        .sidebar {
+            width: 240px; background: var(--sidebar-bg); color: var(--sidebar-fg);
+            display: flex; flex-direction: column; flex-shrink: 0;
+        }
+        .sidebar-brand { padding: 1rem; display: flex; align-items: center; gap: 0.5rem; }
+        .sidebar-brand-icon {
+            width: 28px; height: 28px; border-radius: 6px; background: var(--sidebar-primary);
+            display: flex; align-items: center; justify-content: center; font-size: 14px; color: var(--secondary-foreground);
+        }
+        .sidebar-nav { flex: 1; padding: 0.5rem; }
+        .sidebar-link {
+            display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 0.75rem;
+            border-radius: var(--radius); font-size: 0.875rem; color: var(--sidebar-fg);
+            transition: all 0.15s; margin-bottom: 2px;
+        }
+        .sidebar-link:hover, .sidebar-link.active { background: var(--sidebar-accent); color: var(--sidebar-accent-fg); }
+        .sidebar-footer { padding: 0.75rem; border-top: 1px solid var(--sidebar-border); }
+
+        .admin-main { flex: 1; display: flex; flex-direction: column; }
+        .admin-header { height: 48px; display: flex; align-items: center; border-bottom: 1px solid var(--border); background: var(--card); padding: 0 1rem; }
+        .admin-content { flex: 1; padding: 1.5rem; overflow: auto; }
+
+        /* ---- Student Header ---- */
+        .student-header {
+            border-bottom: 1px solid var(--border); background: var(--card);
+            padding: 0.75rem 1rem; display: flex; align-items: center; justify-content: space-between;
+        }
+
+        /* ---- Stats Grid ---- */
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }
+        .stat-icon {
+            width: 40px; height: 40px; border-radius: 8px;
+            display: flex; align-items: center; justify-content: center; font-size: 1.25rem;
+        }
+        .stat-value { font-size: 1.875rem; font-weight: 700; color: var(--foreground); }
+
+        /* ---- QR ---- */
+        .qr-box { background: var(--card); padding: 1rem; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); display: inline-block; }
+        .qr-preview { background: var(--muted); border-radius: 8px; padding: 1rem; display: flex; flex-direction: column; align-items: center; gap: 0.75rem; }
+
+        /* ---- Scanner ---- */
+        #qr-reader { width: 100%; min-height: 280px; border-radius: 8px; overflow: hidden; background: var(--muted); }
+        #qr-reader video { width: 100% !important; border-radius: 8px; }
+
+        /* ---- Collapsible ---- */
+        .collapsible-header { cursor: pointer; transition: background 0.15s; }
+        .collapsible-header:hover { background: hsl(100 10% 93% / 0.5); }
+        .collapsible-content { display: none; }
+        .collapsible-content.open { display: block; }
+
+        /* ---- Dialog/Modal ---- */
+        .modal-overlay {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: none;
+            align-items: center; justify-content: center; z-index: 100; padding: 1rem;
+        }
+        .modal-overlay.open { display: flex; }
+        .modal {
+            background: var(--card); border-radius: var(--radius); max-width: 28rem;
+            width: 100%; padding: 1.5rem; box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.25);
+        }
+        .modal h3 { font-size: 1.125rem; font-weight: 600; margin-bottom: 1rem; }
+
+        /* ---- Color helpers ---- */
+        .text-gold { color: var(--gold); }
+        .text-muted { color: var(--muted-foreground); }
+        .text-primary { color: var(--primary); }
+        .text-success { color: var(--success); }
+        .bg-muted { background: var(--muted); }
+
+        /* ---- Face Registration ---- */
+        .face-phone-frame {
+            max-width: 22rem; margin: 0 auto; border-radius: 2rem;
+            border: 1px solid var(--border); background: var(--card);
+            padding: 0.75rem; box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1);
+        }
+        .face-viewport {
+            position: relative; aspect-ratio: 3/4; overflow: hidden;
+            border-radius: 1.5rem; background: var(--muted);
+        }
+        .face-viewport video {
+            width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1);
+        }
+        .face-guide-circle {
+            pointer-events: none; position: absolute;
+            left: 50%; top: 16%; transform: translateX(-50%);
+            width: 14rem; height: 14rem; border-radius: 50%;
+            border: 3px solid hsl(152 60% 22% / 0.9);
+        }
+        .face-scan-line {
+            pointer-events: none; position: absolute;
+            left: 50%; top: 43%; transform: translateX(-50%);
+            width: 9rem; height: 0.375rem; border-radius: 9999px;
+            background: hsl(152 60% 22% / 0.8);
+            animation: pulse 2s infinite;
+        }
+        .face-info-overlay {
+            position: absolute; inset: 0 1rem 1rem 1rem; top: auto;
+            border-radius: 1rem; background: hsl(0 0% 100% / 0.9);
+            backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+            padding: 0.75rem 1rem; text-align: center;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        }
+        .face-icon-circle {
+            width: 10rem; height: 10rem; border-radius: 50%;
+            border: 3px solid hsl(152 60% 22% / 0.8);
+            background: var(--card); display: flex; align-items: center;
+            justify-content: center; font-size: 5rem; color: var(--primary);
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .animate-spin { animation: spin 1s linear infinite; }
+
+        /* ---- Responsive ---- */
+        @media (max-width: 768px) {
+            .sidebar { width: 60px; }
+            .sidebar-label, .sidebar .sidebar-link span { display: none; }
+            .sidebar-brand span { display: none; }
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .table { font-size: 0.75rem; }
+            .table th, .table td { padding: 0.5rem; }
+            .hide-mobile { display: none; }
+        }
+
+        /* ---- SVG Icons (inline) ---- */
+        .icon { width: 1em; height: 1em; display: inline-block; vertical-align: -0.125em; }
+        .icon-sm { width: 0.75rem; height: 0.75rem; }
+        .icon-lg { width: 1.25rem; height: 1.25rem; }
+        .icon-xl { width: 3rem; height: 3rem; opacity: 0.3; }
+    </style>
+</head>
+<body>
+<?php
+// Show flash messages
+if ($flash): ?>
+    <div style="position:fixed;top:1rem;right:1rem;z-index:200;max-width:400px;">
+        <div class="flash flash-<?= $flash['type'] ?>"><?= e($flash['msg']) ?></div>
+    </div>
+    <script>setTimeout(() => document.querySelector('.flash')?.parentElement?.remove(), 4000);</script>
+<?php endif;
+
+// Render page
+switch ($page) {
+    case 'login': renderLogin(); break;
+    case 'face_register': renderFaceRegistration(); break;
+    case 'student': renderStudentDashboard($pdo); break;
+    case 'admin': renderAdminPage($pdo, 'home'); break;
+    case 'admin_events': renderAdminPage($pdo, 'events'); break;
+    case 'admin_qr_generator': renderAdminPage($pdo, 'qr_generator'); break;
+    case 'admin_qr_scanner': renderAdminPage($pdo, 'qr_scanner'); break;
+    case 'admin_attendance': renderAdminPage($pdo, 'attendance'); break;
+    case 'admin_archived': renderAdminPage($pdo, 'archived'); break;
+    case 'install': echo '<pre>' . e(getInstallSQL()) . '</pre>'; break;
+    default: renderLogin();
+}
+?>
+</body>
+</html>
+<?php
+// ======================== PAGE RENDERERS ========================
+
+function renderLogin() {
+    global $COURSES, $YEAR_LEVELS;
+    ?>
+    <div class="login-wrapper" style="position:relative;">
+        <div style="position:absolute;inset:0;background:url('images/feu-roosevelt-bg.png') center/cover no-repeat;z-index:0;"></div>
+        <div style="position:absolute;inset:0;background:hsl(var(--background)/0.8);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);z-index:1;"></div>
+        <div class="mb-8 text-center" style="position:relative;z-index:2;">
+            <div style="display:inline-flex;align-items:center;gap:0.75rem;" class="mb-2">
+                <div style="width:48px;height:48px;border-radius:8px;background:var(--primary);display:flex;align-items:center;justify-content:center;">
+                    <span style="font-size:1.5rem;color:var(--primary-foreground);">▣</span>
+                </div>
+                <h1 style="font-size:1.875rem;" class="font-extrabold">Tap<span class="text-gold">track</span></h1>
+            </div>
+            <p class="text-sm text-muted">QR Code Attendance System — FEU Roosevelt Marikina</p>
+        </div>
+
+        <div class="card shadow-lg max-w-md w-full" style="position:relative;z-index:2;">
+            <div class="card-header">
+                <div class="card-title" style="font-size:1.125rem;">Welcome</div>
+                <p class="card-desc">Choose your role to continue</p>
+            </div>
+            <div class="card-content">
+                <!-- Tabs -->
+                <div class="tabs-list mb-4" id="login-tabs">
+                    <button class="tab-trigger active" onclick="switchTab('student')" id="tab-student">🎓 Student</button>
+                    <button class="tab-trigger" onclick="switchTab('admin')" id="tab-admin">🛡️ Admin</button>
+                </div>
+
+                <!-- Student Tab -->
+                <div id="panel-student">
+                    <div class="flex gap-2 mb-4">
+                        <button class="btn btn-active flex-1" id="btn-login" onclick="switchStudentMode('login')">🔑 Log In</button>
+                        <button class="btn btn-outline flex-1" id="btn-register" onclick="switchStudentMode('register')">➕ Register</button>
+                    </div>
+
+                    <!-- Student Login Form -->
+                    <form method="POST" id="form-student-login" class="space-y-3">
+                        <input type="hidden" name="action" value="student_login">
+                        <div>
+                            <label class="label">FEU Email</label>
+                            <input class="input" name="email" placeholder="R20260101001@feuroosevelt.edu.ph">
+                        </div>
+                        <div>
+                            <label class="label">Password</label>
+                            <input class="input" type="password" name="password" placeholder="••••••">
+                        </div>
+                        <p class="text-xs text-muted">Enter your registered FEU email and password to sign in.</p>
+                        <button type="submit" class="btn btn-primary w-full mt-2">🔑 Sign In</button>
+                        <p class="text-xs text-center text-muted mt-2">Don't have an account? <a href="#" class="text-primary" onclick="switchStudentMode('register');return false;" style="text-decoration:underline;">Register here</a></p>
+                    </form>
+
+                    <!-- Student Register Form -->
+                    <form method="POST" id="form-student-register" class="space-y-3" style="display:none;">
+                        <input type="hidden" name="action" value="student_register">
+                        <div>
+                            <label class="label">FEU Email</label>
+                            <input class="input" name="email" placeholder="R20260101001@feuroosevelt.edu.ph">
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <div><label class="label">First Name</label><input class="input" name="first_name" placeholder="Juan"></div>
+                            <div><label class="label">Last Name</label><input class="input" name="last_name" placeholder="Dela Cruz"></div>
+                        </div>
+                        <div>
+                            <label class="label">Course / Program</label>
+                            <select class="select" name="course">
+                                <option value="">Select course...</option>
+                                <?php foreach ($GLOBALS['COURSES'] as $c): ?><option value="<?= e($c) ?>"><?= e($c) ?></option><?php endforeach; ?>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="label">Year Level</label>
+                            <select class="select" name="year_level">
+                                <option value="">Select year level...</option>
+                                <?php foreach ($GLOBALS['YEAR_LEVELS'] as $y): ?><option value="<?= e($y) ?>"><?= e($y) ?></option><?php endforeach; ?>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="label">Password</label>
+                            <input class="input" type="password" name="password" placeholder="Create a password">
+                        </div>
+                        <button type="submit" class="btn btn-primary w-full mt-2">➕ Register</button>
+                        <p class="text-xs text-center text-muted mt-2">Already have an account? <a href="#" class="text-primary" onclick="switchStudentMode('login');return false;" style="text-decoration:underline;">Sign in here</a></p>
+                    </form>
+                </div>
+
+                <!-- Admin Tab -->
+                <div id="panel-admin" style="display:none;">
+                    <form method="POST" class="space-y-3">
+                        <input type="hidden" name="action" value="admin_login">
+                        <div><label class="label">Username</label><input class="input" name="username" placeholder="admin"></div>
+                        <div><label class="label">Password</label><input class="input" type="password" name="password" placeholder="••••••"></div>
+                        <p class="text-xs text-muted">Demo credentials: admin / admin123</p>
+                        <button type="submit" class="btn btn-primary w-full mt-2">🛡️ Login as Admin</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+        <p class="mt-4 text-xs text-muted">Demo System — No email verification required</p>
+    </div>
+
+    <script>
+    function switchTab(tab) {
+        document.getElementById('panel-student').style.display = tab === 'student' ? 'block' : 'none';
+        document.getElementById('panel-admin').style.display = tab === 'admin' ? 'block' : 'none';
+        document.getElementById('tab-student').className = 'tab-trigger' + (tab === 'student' ? ' active' : '');
+        document.getElementById('tab-admin').className = 'tab-trigger' + (tab === 'admin' ? ' active' : '');
+    }
+    function switchStudentMode(mode) {
+        document.getElementById('form-student-login').style.display = mode === 'login' ? 'block' : 'none';
+        document.getElementById('form-student-register').style.display = mode === 'register' ? 'block' : 'none';
+        document.getElementById('btn-login').className = 'btn flex-1 ' + (mode === 'login' ? 'btn-active' : 'btn-outline');
+        document.getElementById('btn-register').className = 'btn flex-1 ' + (mode === 'register' ? 'btn-active' : 'btn-outline');
+    }
+    </script>
+    <?php
+}
+
+// ======================== FACE REGISTRATION PAGE ========================
+function renderFaceRegistration() {
+    $studentId = $_SESSION['face_reg_student_id'] ?? '';
+    $studentName = $_SESSION['user_name'] ?? 'Student';
+    ?>
+    <div class="login-wrapper" style="position:relative;">
+        <div style="position:absolute;inset:0;background:url('images/feu-roosevelt-bg.png') center/cover no-repeat;z-index:0;"></div>
+        <div style="position:absolute;inset:0;background:linear-gradient(135deg, hsla(145, 60%, 18%, 0.75) 0%, hsla(45, 85%, 45%, 0.65) 50%, hsla(145, 50%, 25%, 0.8) 100%);z-index:1;"></div>
+
+        <div style="position:relative;z-index:2;width:100%;max-width:28rem;" class="space-y-4">
+            <div class="text-center mb-4">
+                <div style="width:48px;height:48px;border-radius:8px;background:var(--primary);display:inline-flex;align-items:center;justify-content:center;margin-bottom:0.5rem;">
+                    <span style="font-size:1.5rem;color:var(--primary-foreground);">▣</span>
+                </div>
+                <h2 style="font-size:1.25rem;color:#fff;font-weight:700;text-shadow:0 2px 4px rgba(0,0,0,0.2);">Almost Done!</h2>
+                <p class="text-sm" style="color:rgba(255,255,255,0.8);text-shadow:0 1px 2px rgba(0,0,0,0.15);">Register your face to complete your account setup.</p>
+            </div>
+
+            <!-- Face Registration Card -->
+            <div class="card shadow-xl" style="border-color:hsl(152 60% 22% / 0.2);" id="face-reg-card">
+                <div style="background:var(--primary);padding:0.75rem 1rem;color:var(--primary-foreground);">
+                    <div class="flex items-center gap-2 text-sm font-bold">🛡️ Verify with Face Recognition</div>
+                </div>
+                <div style="padding:1.25rem;" class="space-y-5">
+                    <!-- Phone Frame -->
+                    <div class="face-phone-frame">
+                        <div class="face-viewport" id="face-viewport">
+                            <!-- Idle state -->
+                            <div id="face-idle" class="flex flex-col items-center justify-center" style="height:100%;gap:1.25rem;padding:1.5rem;text-align:center;">
+                                <div class="face-icon-circle">👤</div>
+                                <div class="space-y-2">
+                                    <p style="font-size:1.25rem;font-weight:600;">Take a selfie to secure your account</p>
+                                    <p class="text-sm text-muted" style="line-height:1.5;">We will use one clear selfie for student face verification during attendance.</p>
+                                </div>
+                            </div>
+                            <!-- Camera active state -->
+                            <video id="face-video" style="display:none;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);" playsinline muted autoplay></video>
+                            <div id="face-guide" style="display:none;">
+                                <div class="face-guide-circle"></div>
+                                <div class="face-scan-line"></div>
+                                <div class="face-info-overlay">
+                                    <p class="text-sm font-medium">Center your face inside the circle</p>
+                                    <p class="text-xs text-muted mt-2">Keep your eyes open, remove masks, and stay in good lighting.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Status Text -->
+                    <div class="text-center space-y-3" id="face-status-area">
+                        <p class="text-sm font-medium" id="face-title">Make sure your full face is visible before continuing.</p>
+                        <p class="text-xs text-muted" id="face-subtitle">Use a bright area, keep the phone steady, and allow camera access when asked.</p>
+                        <p class="text-xs" style="color:var(--destructive);display:none;" id="face-error"></p>
+                        <p class="flex items-center justify-center gap-2 text-sm text-muted" id="face-loading" style="display:none;">
+                            <span class="animate-spin" style="display:inline-block;width:1rem;height:1rem;border:2px solid var(--muted);border-top-color:var(--primary);border-radius:50%;"></span>
+                            <span id="face-loading-text">Preparing selfie scanner...</span>
+                        </p>
+                    </div>
+
+                    <!-- Buttons -->
+                    <div class="flex flex-col gap-2" id="face-buttons">
+                        <button class="btn btn-primary w-full" id="btn-start-camera" onclick="startFaceCamera()">Next →</button>
+                        <button class="btn btn-primary w-full" id="btn-capture" onclick="captureFace()" style="display:none;" disabled>📷 Take Selfie</button>
+                        <button class="btn btn-outline w-full" id="btn-restart" onclick="startFaceCamera()" style="display:none;">🔄 Restart Camera</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Success Card (hidden initially) -->
+            <div class="card shadow-xl" id="face-success-card" style="display:none;border-color:hsl(152 60% 40% / 0.3);background:hsl(152 60% 40% / 0.05);">
+                <div style="background:var(--success);padding:0.75rem 1rem;text-align:center;font-weight:600;font-size:0.875rem;color:var(--success-foreground);">Verification complete</div>
+                <div style="padding:2rem;" class="flex flex-col items-center gap-3 text-center">
+                    <span style="font-size:3.5rem;">✅</span>
+                    <p class="font-bold" style="font-size:1.125rem;">Face Registered Successfully</p>
+                    <p class="text-sm text-muted">You can now continue to your student account.</p>
+                    <form method="POST" class="mt-2 w-full">
+                        <input type="hidden" name="action" value="skip_face_reg">
+                        <button type="submit" class="btn btn-primary w-full">Continue to Dashboard →</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+    <script>
+    const STUDENT_ID = '<?= e($studentId) ?>';
+    const MODEL_URL = 'https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights';
+    let faceStream = null;
+    let modelsLoaded = false;
+    let modelsLoading = false;
+
+    async function loadModels() {
+        if (modelsLoaded) return;
+        if (modelsLoading) return modelsLoading;
+        modelsLoading = (async () => {
+            await Promise.all([
+                faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+                faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL),
+                faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+            ]);
+            modelsLoaded = true;
+        })();
+        return modelsLoading;
+    }
+
+    async function startFaceCamera() {
+        const video = document.getElementById('face-video');
+        const idle = document.getElementById('face-idle');
+        const guide = document.getElementById('face-guide');
+        const btnStart = document.getElementById('btn-start-camera');
+        const btnCapture = document.getElementById('btn-capture');
+        const btnRestart = document.getElementById('btn-restart');
+        const loading = document.getElementById('face-loading');
+        const error = document.getElementById('face-error');
+        const title = document.getElementById('face-title');
+        const subtitle = document.getElementById('face-subtitle');
+
+        error.style.display = 'none';
+        btnStart.disabled = true;
+        btnStart.textContent = '⏳ Opening Camera...';
+
+        try {
+            // Stop existing stream
+            if (faceStream) {
+                faceStream.getTracks().forEach(t => t.stop());
+                faceStream = null;
+            }
+
+            // CRITICAL: getUserMedia called directly in click handler for gesture context
+            faceStream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: { ideal: 'user' }, width: { ideal: 720 }, height: { ideal: 960 } },
+                audio: false
+            });
+
+            video.srcObject = faceStream;
+            video.style.display = 'block';
+            idle.style.display = 'none';
+            guide.style.display = 'block';
+
+            btnStart.style.display = 'none';
+            btnCapture.style.display = 'flex';
+            btnCapture.disabled = true;
+            btnRestart.style.display = 'flex';
+
+            title.textContent = 'Your live selfie preview is ready.';
+            subtitle.textContent = 'Preparing the selfie scanner. Keep the camera open for a moment.';
+            loading.style.display = 'flex';
+            document.getElementById('face-loading-text').textContent = 'Preparing selfie scanner...';
+
+            // Load models in background
+            loadModels().then(() => {
+                loading.style.display = 'none';
+                btnCapture.disabled = false;
+                title.textContent = 'Your live selfie preview is ready.';
+                subtitle.textContent = 'Look straight at the camera and tap Take Selfie.';
+            }).catch(err => {
+                console.error('Model load error:', err);
+                loading.style.display = 'none';
+                error.textContent = 'Selfie scanner could not start. Please restart the camera.';
+                error.style.display = 'block';
+            });
+
+        } catch (err) {
+            console.error('Camera error:', err);
+            btnStart.disabled = false;
+            btnStart.textContent = 'Next →';
+            let msg = 'Could not access the camera. Please try again.';
+            if (err.name === 'NotAllowedError') msg = 'Allow camera access to continue with selfie verification.';
+            else if (err.name === 'NotFoundError') msg = 'No camera was detected on this device.';
+            else if (err.name === 'NotReadableError') msg = 'Your camera is being used by another app or browser tab.';
+            error.textContent = msg;
+            error.style.display = 'block';
+        }
+    }
+
+    async function captureFace() {
+        const video = document.getElementById('face-video');
+        const btnCapture = document.getElementById('btn-capture');
+        const btnRestart = document.getElementById('btn-restart');
+        const loading = document.getElementById('face-loading');
+        const error = document.getElementById('face-error');
+        const title = document.getElementById('face-title');
+        const subtitle = document.getElementById('face-subtitle');
+
+        btnCapture.disabled = true;
+        btnCapture.innerHTML = '<span class="animate-spin" style="display:inline-block;width:1rem;height:1rem;border:2px solid hsl(50 100% 95%);border-top-color:transparent;border-radius:50%;margin-right:0.5rem;"></span> Capturing Selfie...';
+        btnRestart.disabled = true;
+        error.style.display = 'none';
+
+        try {
+            if (!modelsLoaded) {
+                loading.style.display = 'flex';
+                document.getElementById('face-loading-text').textContent = 'Loading face recognition...';
+                await loadModels();
+                loading.style.display = 'none';
+            }
+
+            title.textContent = 'Scanning...';
+            subtitle.textContent = 'Hold still, keep your full face visible, and look directly at the camera.';
+
+            const PRESETS = [
+                { inputSize: 512, scoreThreshold: 0.2 },
+                { inputSize: 416, scoreThreshold: 0.2 },
+                { inputSize: 320, scoreThreshold: 0.15 },
+                { inputSize: 224, scoreThreshold: 0.1 },
+            ];
+
+            let descriptor = null;
+            for (let attempt = 0; attempt < 14; attempt++) {
+                for (const preset of PRESETS) {
+                    const detection = await faceapi
+                        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions(preset))
+                        .withFaceLandmarks(true)
+                        .withFaceDescriptor();
+                    if (detection?.descriptor) {
+                        descriptor = detection.descriptor;
+                        break;
+                    }
+                }
+                if (descriptor) break;
+
+                // Try canvas snapshot
+                if (!descriptor) {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = video.videoWidth || 640;
+                    canvas.height = video.videoHeight || 480;
+                    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+                    for (const preset of PRESETS) {
+                        const det = await faceapi
+                            .detectSingleFace(canvas, new faceapi.TinyFaceDetectorOptions(preset))
+                            .withFaceLandmarks(true)
+                            .withFaceDescriptor();
+                        if (det?.descriptor) {
+                            descriptor = det.descriptor;
+                            break;
+                        }
+                    }
+                }
+                if (descriptor) break;
+                await new Promise(r => setTimeout(r, 350));
+            }
+
+            if (!descriptor) {
+                error.textContent = 'Center your face inside the guide, remove backlight, and try again.';
+                error.style.display = 'block';
+                title.textContent = 'Your live selfie preview is ready.';
+                subtitle.textContent = 'Look straight at the camera and tap Take Selfie.';
+                return;
+            }
+
+            // Save to server
+            const json = JSON.stringify(Array.from(descriptor));
+            const resp = await fetch('?ajax=save_face_descriptor', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ student_id: STUDENT_ID, face_descriptor: json })
+            });
+            const result = await resp.json();
+
+            if (!result.success) {
+                error.textContent = 'Could not save your face data. Please try again.';
+                error.style.display = 'block';
+                return;
+            }
+
+            // Success!
+            if (faceStream) {
+                faceStream.getTracks().forEach(t => t.stop());
+                faceStream = null;
+            }
+            document.getElementById('face-reg-card').style.display = 'none';
+            document.getElementById('face-success-card').style.display = 'block';
+
+        } catch (err) {
+            console.error('Face capture error:', err);
+            error.textContent = 'We could not capture a stable selfie frame. Restart the camera and try again.';
+            error.style.display = 'block';
+            title.textContent = 'Your live selfie preview is ready.';
+            subtitle.textContent = 'Look straight at the camera and tap Take Selfie.';
+        } finally {
+            btnCapture.disabled = false;
+            btnCapture.innerHTML = '📷 Take Selfie';
+            btnRestart.disabled = false;
+        }
+    }
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+        if (faceStream) faceStream.getTracks().forEach(t => t.stop());
+    });
+    </script>
+    <?php
+}
+
+function renderStudentDashboard($pdo) {
+    $student_id = $_SESSION['user_id'];
+    $stmt = $pdo->prepare("SELECT * FROM students WHERE id = ?");
+    $stmt->execute([$student_id]);
+    $student = $stmt->fetch();
+    if (!$student) { header('Location: ?page=login'); exit; }
+
+    $events = $pdo->query("SELECT * FROM events WHERE archived = 0 ORDER BY date")->fetchAll();
+    $stmt = $pdo->prepare("SELECT event_id FROM attendance WHERE student_id = ?");
+    $stmt->execute([$student_id]);
+    $attended = array_column($stmt->fetchAll(), 'event_id');
+    ?>
+    <div class="student-header">
+        <div class="flex items-center gap-2">
+            <div style="width:32px;height:32px;border-radius:6px;background:var(--primary);display:flex;align-items:center;justify-content:center;">
+                <span style="color:var(--primary-foreground);font-size:0.875rem;">▣</span>
+            </div>
+            <span class="font-bold">Tap<span class="text-gold">track</span></span>
+        </div>
+        <div class="flex items-center gap-3">
+            <span class="text-sm text-muted hide-mobile"><?= e($student['first_name'] . ' ' . $student['last_name']) ?></span>
+            <form method="POST" style="display:inline;"><input type="hidden" name="action" value="logout"><button type="submit" class="btn btn-ghost btn-sm">⬅ Logout</button></form>
+        </div>
+    </div>
+
+    <main style="max-width:48rem;margin:0 auto;padding:1.5rem;" class="space-y-6">
+        <div>
+            <h2 style="font-size:1.5rem;" class="font-bold">Welcome, <?= e($student['first_name']) ?>!</h2>
+            <p class="text-sm text-muted"><?= e($student['email']) ?> · <?= e($student['course']) ?> · <?= e($student['year_level']) ?></p>
+        </div>
+
+        <?php if (empty($student['face_descriptor'])): ?>
+        <div class="card" style="border-color:hsl(45 90% 55% / 0.5);background:hsl(45 90% 55% / 0.05);">
+            <div class="card-header">
+                <div class="card-title flex items-center gap-2">⚠️ Face Not Registered</div>
+                <p class="card-desc">You haven't completed face registration yet. Face verification may be required during events.</p>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <div class="space-y-3">
+            <h3 style="font-size:1.125rem;" class="font-bold">Upcoming Events</h3>
+            <?php foreach ($events as $evt):
+                $isAttended = in_array($evt['id'], $attended);
+            ?>
+            <div class="card" style="cursor:pointer;" onclick="toggleQR('<?= e($evt['id']) ?>')">
+                <div class="card-header">
+                    <div class="flex justify-between" style="align-items:flex-start;">
+                        <div>
+                            <div class="card-title"><?= e($evt['name']) ?></div>
+                            <p class="card-desc"><?= e($evt['description'] ?? '') ?></p>
+                        </div>
+                        <?php if ($isAttended): ?><span class="badge badge-success">✓ Attended</span><?php endif; ?>
+                    </div>
+                </div>
+                <div class="card-content" style="padding-top:0;">
+                    <div class="flex gap-4 text-xs text-muted">
+                        <span>📅 <?= e($evt['date']) ?></span>
+                        <span>📍 <?= e($evt['location']) ?></span>
+                    </div>
+                    <div id="qr-<?= e($evt['id']) ?>" style="display:none;" class="qr-preview mt-4">
+                        <p class="text-sm font-medium">Your QR Code for this event</p>
+                        <div class="qr-box"><canvas id="qr-canvas-<?= e($evt['id']) ?>"></canvas></div>
+                        <p class="text-xs text-muted text-center">Show this QR code to the event organizer to record your attendance.</p>
+                    </div>
+                </div>
+            </div>
+            <?php endforeach; ?>
+            <?php if (empty($events)): ?>
+                <div class="card"><div class="card-content py-12 text-center text-muted">No upcoming events.</div></div>
+            <?php endif; ?>
+        </div>
+    </main>
+
+    <script>
+    function toggleQR(eventId) {
+        const el = document.getElementById('qr-' + eventId);
+        const isOpen = el.style.display !== 'none';
+        // Close all
+        document.querySelectorAll('[id^="qr-"]').forEach(e => { if(e.id.startsWith('qr-')) e.style.display = 'none'; });
+        if (!isOpen) {
+            el.style.display = 'flex';
+            const canvas = document.getElementById('qr-canvas-' + eventId);
+            if (!canvas.dataset.rendered) {
+                QRCode.toCanvas(canvas, JSON.stringify({studentId: '<?= e($student_id) ?>', eventId: eventId, system: 'taptrack'}), {width: 180, errorCorrectionLevel: 'H'});
+                canvas.dataset.rendered = '1';
+            }
+        }
+    }
+    </script>
+    <?php
+}
+
+function renderAdminPage($pdo, $subpage) {
+    $adminPages = [
+        'home' => ['Dashboard', 'admin', '🏠'],
+        'events' => ['Events', 'admin_events', '📅'],
+        'qr_generator' => ['QR Generator', 'admin_qr_generator', '▣'],
+        'qr_scanner' => ['QR Scanner', 'admin_qr_scanner', '📷'],
+        'attendance' => ['Attendance', 'admin_attendance', '📋'],
+        'archived' => ['Archived Events', 'admin_archived', '📦'],
+    ];
+    ?>
+    <div class="admin-layout">
+        <div class="sidebar">
+            <div class="sidebar-brand">
+                <div class="sidebar-brand-icon">▣</div>
+                <span class="font-bold">Taptrack</span>
+            </div>
+            <nav class="sidebar-nav">
+                <?php foreach ($adminPages as $key => [$label, $link, $icon]): ?>
+                    <a href="?page=<?= $link ?>" class="sidebar-link <?= $subpage === $key ? 'active' : '' ?>">
+                        <span><?= $icon ?></span>
+                        <span><?= $label ?></span>
+                    </a>
+                <?php endforeach; ?>
+            </nav>
+            <div class="sidebar-footer">
+                <form method="POST"><input type="hidden" name="action" value="logout">
+                    <button type="submit" class="sidebar-link w-full" style="border:none;background:none;cursor:pointer;color:var(--sidebar-fg);font-size:0.875rem;">⬅ <span>Logout</span></button>
+                </form>
+            </div>
+        </div>
+        <div class="admin-main">
+            <div class="admin-header">
+                <span class="text-sm font-medium text-muted">Admin Panel</span>
+            </div>
+            <div class="admin-content">
+                <?php
+                switch ($subpage) {
+                    case 'home': renderAdminHome($pdo); break;
+                    case 'events': renderAdminEvents($pdo); break;
+                    case 'qr_generator': renderAdminQRGenerator($pdo); break;
+                    case 'qr_scanner': renderAdminQRScanner($pdo); break;
+                    case 'attendance': renderAdminAttendance($pdo); break;
+                    case 'archived': renderAdminArchived($pdo); break;
+                }
+                ?>
+            </div>
+        </div>
+    </div>
+    <?php
+}
+
+function renderAdminHome($pdo) {
+    $eventCount = $pdo->query("SELECT COUNT(*) FROM events WHERE archived = 0")->fetchColumn();
+    $studentCount = $pdo->query("SELECT COUNT(*) FROM students")->fetchColumn();
+    $scanCount = $pdo->query("SELECT COUNT(*) FROM attendance")->fetchColumn();
+    $uniqueCount = $pdo->query("SELECT COUNT(DISTINCT student_id) FROM attendance")->fetchColumn();
+
+    $stats = [
+        ['Total Events', $eventCount, 'var(--primary)', 'var(--primary-foreground)', '📅'],
+        ['Registered Students', $studentCount, 'var(--gold)', 'var(--secondary-foreground)', '👥'],
+        ['Total Scans', $scanCount, 'var(--success)', 'var(--success-foreground)', '▣'],
+        ['Unique Attendees', $uniqueCount, 'var(--muted)', 'var(--muted-foreground)', '✓'],
+    ];
+    ?>
+    <div class="space-y-6 max-w-4xl">
+        <h2 style="font-size:1.5rem;" class="font-bold">Dashboard</h2>
+        <div class="stats-grid">
+            <?php foreach ($stats as [$label, $value, $bg, $fg, $icon]): ?>
+            <div class="card">
+                <div class="card-header flex items-center gap-3" style="flex-direction:row;">
+                    <div class="stat-icon" style="background:<?= $bg ?>;color:<?= $fg ?>;"><?= $icon ?></div>
+                    <span class="text-sm font-medium text-muted"><?= $label ?></span>
+                </div>
+                <div class="card-content"><p class="stat-value"><?= $value ?></p></div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+    </div>
+    <?php
+}
+
+function renderAdminEvents($pdo) {
+    $events = $pdo->query("SELECT * FROM events WHERE archived = 0 ORDER BY date")->fetchAll();
+    ?>
+    <div class="space-y-6 max-w-4xl">
+        <div class="flex justify-between items-center">
+            <h2 style="font-size:1.5rem;" class="font-bold">Events Management</h2>
+            <button class="btn btn-primary" onclick="document.getElementById('add-event-modal').classList.add('open')">➕ Add Event</button>
+        </div>
+
+        <?php if (empty($events)): ?>
+            <div class="card"><div class="card-content py-12 text-center text-muted"><p style="font-size:3rem;opacity:0.3;">📅</p><p>No active events. Click "Add Event" to create one.</p></div></div>
+        <?php else: ?>
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">Active Events (<?= count($events) ?>)</div>
+                    <p class="card-desc">These events are visible to students.</p>
+                </div>
+                <div class="card-content">
+                    <table class="table">
+                        <thead><tr><th>Event Name</th><th>Date</th><th>Location</th><th class="hide-mobile">Description</th><th class="text-right">Actions</th></tr></thead>
+                        <tbody>
+                        <?php foreach ($events as $evt): ?>
+                            <tr>
+                                <td class="font-medium"><?= e($evt['name']) ?></td>
+                                <td class="text-sm">📅 <?= e($evt['date']) ?></td>
+                                <td class="text-sm">📍 <?= e($evt['location']) ?></td>
+                                <td class="text-muted text-sm truncate hide-mobile" style="max-width:200px;"><?= e($evt['description'] ?? '—') ?></td>
+                                <td class="text-right">
+                                    <form method="POST" style="display:inline;" onsubmit="return confirm('Archive &quot;<?= e($evt['name']) ?>&quot;? It will be moved to the archive section.')">
+                                        <input type="hidden" name="action" value="archive_event">
+                                        <input type="hidden" name="event_id" value="<?= e($evt['id']) ?>">
+                                        <button type="submit" class="btn btn-outline btn-sm">📦 Archive</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        <?php endif; ?>
+    </div>
+
+    <!-- Add Event Modal -->
+    <div class="modal-overlay" id="add-event-modal">
+        <div class="modal">
+            <h3>Create New Event</h3>
+            <form method="POST" class="space-y-4">
+                <input type="hidden" name="action" value="add_event">
+                <div><label class="label">Event Name</label><input class="input" name="name" placeholder="e.g. FEU Tech Week" required></div>
+                <div><label class="label">Date</label><input class="input" type="date" name="date" required></div>
+                <div><label class="label">Location</label><input class="input" name="location" placeholder="e.g. Auditorium" required></div>
+                <div><label class="label">Description (optional)</label><textarea class="textarea" name="description" placeholder="Event details..."></textarea></div>
+                <div class="flex gap-2 justify-between" style="margin-top:1rem;">
+                    <button type="button" class="btn btn-outline" onclick="document.getElementById('add-event-modal').classList.remove('open')">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create Event</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    <?php
+}
+
+function renderAdminQRGenerator($pdo) {
+    $events = $pdo->query("SELECT * FROM events WHERE archived = 0 ORDER BY date")->fetchAll();
+    $students = $pdo->query("SELECT id, first_name, last_name, student_number FROM students ORDER BY created_at")->fetchAll();
+    ?>
+    <div class="space-y-6 max-w-lg">
+        <h2 style="font-size:1.5rem;" class="font-bold">QR Generator</h2>
+        <div class="card">
+            <div class="card-header"><div class="card-title">Generate Student QR Code</div></div>
+            <div class="card-content space-y-4">
+                <div>
+                    <label class="label">Select Student</label>
+                    <select class="select" id="gen-student" onchange="generateQR()">
+                        <option value="">Choose a student...</option>
+                        <?php foreach ($students as $s): ?>
+                            <option value="<?= e($s['id']) ?>"><?= e($s['first_name'] . ' ' . $s['last_name'] . ' (' . $s['student_number'] . ')') ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div>
+                    <label class="label">Select Event</label>
+                    <select class="select" id="gen-event" onchange="generateQR()">
+                        <option value="">Choose an event...</option>
+                        <?php foreach ($events as $ev): ?>
+                            <option value="<?= e($ev['id']) ?>"><?= e($ev['name']) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div id="gen-output" style="display:none;" class="qr-preview mt-4">
+                    <div class="qr-box"><canvas id="gen-canvas"></canvas></div>
+                    <p class="text-sm font-medium" id="gen-name"></p>
+                    <p class="text-xs text-muted" id="gen-event-name"></p>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+    function generateQR() {
+        const studentId = document.getElementById('gen-student').value;
+        const eventId = document.getElementById('gen-event').value;
+        const output = document.getElementById('gen-output');
+        if (!studentId || !eventId) { output.style.display = 'none'; return; }
+        output.style.display = 'flex';
+        const canvas = document.getElementById('gen-canvas');
+        QRCode.toCanvas(canvas, JSON.stringify({studentId, eventId, system:'taptrack'}), {width:200, errorCorrectionLevel:'H'});
+        document.getElementById('gen-name').textContent = document.getElementById('gen-student').selectedOptions[0].text;
+        document.getElementById('gen-event-name').textContent = document.getElementById('gen-event').selectedOptions[0].text;
+    }
+    </script>
+    <?php
+}
+
+function renderAdminQRScanner($pdo) {
+    $events = $pdo->query("SELECT * FROM events WHERE archived = 0 ORDER BY date")->fetchAll();
+    ?>
+    <div class="space-y-6 max-w-lg">
+        <h2 style="font-size:1.5rem;" class="font-bold">QR Scanner</h2>
+        <div class="card">
+            <div class="card-header"><div class="card-title">📷 Scan Student QR Codes</div></div>
+            <div class="card-content space-y-4">
+                <div>
+                    <label class="label">Event</label>
+                    <select class="select" id="scan-event">
+                        <option value="">Select event to scan for...</option>
+                        <?php foreach ($events as $ev): ?>
+                            <option value="<?= e($ev['id']) ?>"><?= e($ev['name']) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div style="position:relative;width:100%;min-height:280px;border-radius:8px;overflow:hidden;background:var(--muted);">
+                    <div id="scanner-placeholder" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--muted-foreground);padding:1.5rem;">
+                        <div><p style="font-size:3rem;opacity:0.4;">📷</p><p class="text-sm">Camera preview will appear here</p></div>
+                    </div>
+                    <div id="qr-reader"></div>
+                </div>
+
+                <div class="flex gap-2">
+                    <button class="btn btn-primary flex-1" id="btn-start-scan" onclick="startScanning()">📷 Start Scanning</button>
+                    <button class="btn btn-destructive flex-1" id="btn-stop-scan" onclick="stopScanning()" style="display:none;">Stop Scanning</button>
+                </div>
+
+                <div id="scan-error" class="flash flash-error" style="display:none;"></div>
+                <div id="scan-result" style="display:none;" class="p-3" style="border-radius:var(--radius);"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    let scanner = null;
+    let isScanning = false;
+
+    async function startScanning() {
+        const eventId = document.getElementById('scan-event').value;
+        if (!eventId) { alert('Please select an event first.'); return; }
+        if (isScanning) return;
+
+        document.getElementById('scan-error').style.display = 'none';
+        document.getElementById('scan-result').style.display = 'none';
+        document.getElementById('btn-start-scan').disabled = true;
+        document.getElementById('btn-start-scan').textContent = '⏳ Starting camera...';
+
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}}, audio:false});
+            const deviceId = stream.getVideoTracks()[0]?.getSettings().deviceId;
+            stream.getTracks().forEach(t => t.stop());
+
+            scanner = new Html5Qrcode('qr-reader');
+            const config = {fps:10, qrbox:{width:250, height:250}};
+
+            if (deviceId) {
+                await scanner.start(deviceId, config, onScanSuccess, ()=>{});
+            } else {
+                const cameras = await Html5Qrcode.getCameras();
+                if (!cameras.length) throw new Error('No camera detected.');
+                const back = cameras.find(c => /back|rear|environment/i.test(c.label));
+                await scanner.start(back?.id || cameras[0].id, config, onScanSuccess, ()=>{});
+            }
+
+            isScanning = true;
+            document.getElementById('scanner-placeholder').style.display = 'none';
+            document.getElementById('btn-start-scan').style.display = 'none';
+            document.getElementById('btn-stop-scan').style.display = 'flex';
+        } catch (err) {
+            const msg = err.name === 'NotAllowedError' ? 'Camera access denied. Please allow camera permission.' :
+                        err.name === 'NotFoundError' ? 'No camera found on this device.' :
+                        err.name === 'NotReadableError' ? 'Camera is in use by another app.' :
+                        'Unable to start camera: ' + (err.message || err);
+            document.getElementById('scan-error').textContent = msg;
+            document.getElementById('scan-error').style.display = 'block';
+            stopScanning();
+        }
+        document.getElementById('btn-start-scan').disabled = false;
+        document.getElementById('btn-start-scan').textContent = '📷 Start Scanning';
+    }
+
+    async function stopScanning() {
+        if (scanner) {
+            try { await scanner.stop(); } catch {}
+            try { scanner.clear(); } catch {}
+            scanner = null;
+        }
+        isScanning = false;
+        document.getElementById('scanner-placeholder').style.display = 'flex';
+        document.getElementById('btn-start-scan').style.display = 'flex';
+        document.getElementById('btn-stop-scan').style.display = 'none';
+    }
+
+    async function onScanSuccess(decodedText) {
+        const resultEl = document.getElementById('scan-result');
+        const eventId = document.getElementById('scan-event').value;
+        try {
+            const parsed = JSON.parse(decodedText);
+            if (parsed.system !== 'taptrack') {
+                showScanResult(false, 'Invalid QR code — not a Taptrack code.');
+                return;
+            }
+            if (parsed.eventId && parsed.eventId !== eventId) {
+                showScanResult(false, '⚠ This QR code is for a different event and cannot be used for the currently selected event. Please use the correct QR code.');
+                return;
+            }
+            parsed.eventId = eventId;
+            const resp = await fetch('?ajax=scan_qr', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify(parsed)
+            });
+            const data = await resp.json();
+            showScanResult(data.success, data.message);
+        } catch {
+            showScanResult(false, 'Could not read QR code data.');
+        }
+    }
+
+    function showScanResult(success, message) {
+        const el = document.getElementById('scan-result');
+        el.style.display = 'flex';
+        el.style.background = success ? 'hsl(152 60% 40% / 0.1)' : 'hsl(0 72% 51% / 0.1)';
+        el.style.borderRadius = 'var(--radius)';
+        el.style.alignItems = 'center';
+        el.style.gap = '0.5rem';
+        el.innerHTML = `<span style="font-size:1.25rem;">${success ? '✅' : '❌'}</span><span class="text-sm">${message}</span>`;
+    }
+    </script>
+    <?php
+}
+
+function renderAdminAttendance($pdo) {
+    $events = $pdo->query("SELECT * FROM events WHERE archived = 0 ORDER BY date")->fetchAll();
+    $selectedEvent = $_GET['event'] ?? '';
+
+    $attendees = [];
+    $eventName = '';
+    if ($selectedEvent) {
+        $stmt = $pdo->prepare("SELECT a.*, s.first_name, s.last_name, s.student_number, s.course, s.year_level, a.scanned_at FROM attendance a JOIN students s ON a.student_id = s.id WHERE a.event_id = ? ORDER BY a.scanned_at");
+        $stmt->execute([$selectedEvent]);
+        $attendees = $stmt->fetchAll();
+        $stmt2 = $pdo->prepare("SELECT name FROM events WHERE id = ?");
+        $stmt2->execute([$selectedEvent]);
+        $eventName = $stmt2->fetchColumn() ?: '';
+    }
+    ?>
+    <div class="space-y-6 max-w-3xl">
+        <h2 style="font-size:1.5rem;" class="font-bold">Attendance Records</h2>
+        <div>
+            <label class="label">Filter by Event</label>
+            <select class="select" style="max-width:24rem;" onchange="location.href='?page=admin_attendance&event='+this.value">
+                <option value="">Select an event...</option>
+                <?php foreach ($events as $ev): ?>
+                    <option value="<?= e($ev['id']) ?>" <?= $selectedEvent === $ev['id'] ? 'selected' : '' ?>><?= e($ev['name']) ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+
+        <?php if ($selectedEvent): ?>
+            <div class="card">
+                <div class="card-header flex justify-between items-center" style="flex-direction:row;">
+                    <div class="card-title flex items-center gap-2">📋 <?= e($eventName) ?></div>
+                    <span class="badge badge-secondary">👥 <?= count($attendees) ?> attended</span>
+                </div>
+                <div class="card-content">
+                    <?php if (empty($attendees)): ?>
+                        <p class="text-sm text-muted py-12 text-center">No attendance records yet for this event.</p>
+                    <?php else: ?>
+                        <table class="table">
+                            <thead><tr><th>#</th><th>Student Name</th><th>Student Number</th><th class="hide-mobile">Course</th><th class="hide-mobile">Year</th><th>Scanned At</th></tr></thead>
+                            <tbody>
+                            <?php foreach ($attendees as $i => $r): ?>
+                                <tr>
+                                    <td class="font-medium"><?= $i + 1 ?></td>
+                                    <td><?= e($r['first_name'] . ' ' . $r['last_name']) ?></td>
+                                    <td class="font-mono text-sm"><?= e($r['student_number']) ?></td>
+                                    <td class="hide-mobile"><?= e($r['course']) ?></td>
+                                    <td class="hide-mobile"><?= e($r['year_level']) ?></td>
+                                    <td class="text-muted text-sm"><?= date('M j, Y g:i A', strtotime($r['scanned_at'])) ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    <?php endif; ?>
+                </div>
+            </div>
+        <?php else: ?>
+            <div class="card"><div class="card-content py-12 text-center text-muted"><p style="font-size:3rem;opacity:0.3;">📋</p><p>Select an event to view attendance records.</p></div></div>
+        <?php endif; ?>
+    </div>
+    <?php
+}
+
+function renderAdminArchived($pdo) {
+    $events = $pdo->query("SELECT * FROM events WHERE archived = 1 ORDER BY date DESC")->fetchAll();
+    $search = $_GET['search'] ?? '';
+
+    if ($search) {
+        $events = array_filter($events, function($evt) use ($search) {
+            $s = strtolower($search);
+            return strpos(strtolower($evt['name']), $s) !== false ||
+                   strpos(strtolower($evt['location']), $s) !== false ||
+                   strpos($evt['date'], $search) !== false;
+        });
+    }
+    ?>
+    <div class="space-y-6 max-w-4xl">
+        <h2 style="font-size:1.5rem;" class="font-bold">Archived Events</h2>
+        <p class="text-sm text-muted">Past events and their attendance history are preserved here.</p>
+
+        <form method="GET" style="max-width:24rem;position:relative;">
+            <input type="hidden" name="page" value="admin_archived">
+            <input class="input" name="search" placeholder="Search by name, location, or date..." value="<?= e($search) ?>" style="padding-left:2.25rem;">
+            <span style="position:absolute;left:0.75rem;top:50%;transform:translateY(-50%);color:var(--muted-foreground);">🔍</span>
+        </form>
+
+        <?php if (empty($events)): ?>
+            <div class="card"><div class="card-content py-12 text-center text-muted"><p style="font-size:3rem;opacity:0.3;">📦</p><p><?= $search ? 'No events match your search.' : 'No archived events yet.' ?></p></div></div>
+        <?php else: ?>
+            <div class="space-y-3">
+            <?php foreach ($events as $evt):
+                $stmt = $pdo->prepare("SELECT a.*, s.first_name, s.last_name, s.student_number, s.course, s.year_level FROM attendance a JOIN students s ON a.student_id = s.id WHERE a.event_id = ? ORDER BY a.scanned_at");
+                $stmt->execute([$evt['id']]);
+                $attendees = $stmt->fetchAll();
+            ?>
+                <div class="card">
+                    <div class="card-header collapsible-header" onclick="toggleCollapsible('arch-<?= e($evt['id']) ?>')">
+                        <div class="flex justify-between items-center">
+                            <div class="flex items-center gap-3">
+                                <span id="arrow-arch-<?= e($evt['id']) ?>">▸</span>
+                                <div>
+                                    <div class="card-title"><?= e($evt['name']) ?></div>
+                                    <p class="card-desc flex gap-3 mt-1">
+                                        <span>📅 <?= e($evt['date']) ?></span>
+                                        <span>📍 <?= e($evt['location']) ?></span>
+                                    </p>
+                                </div>
+                            </div>
+                            <span class="badge badge-secondary">👥 <?= count($attendees) ?> attended</span>
+                        </div>
+                    </div>
+                    <div class="collapsible-content" id="arch-<?= e($evt['id']) ?>">
+                        <div class="card-content" style="padding-top:0;">
+                            <?php if (empty($attendees)): ?>
+                                <p class="text-sm text-muted py-4 text-center">No attendance records for this event.</p>
+                            <?php else: ?>
+                                <table class="table">
+                                    <thead><tr><th>#</th><th>Student Name</th><th>Student Number</th><th class="hide-mobile">Course</th><th class="hide-mobile">Year</th><th>Scanned At</th></tr></thead>
+                                    <tbody>
+                                    <?php foreach ($attendees as $i => $r): ?>
+                                        <tr>
+                                            <td class="font-medium"><?= $i + 1 ?></td>
+                                            <td><?= e($r['first_name'] . ' ' . $r['last_name']) ?></td>
+                                            <td class="font-mono text-sm"><?= e($r['student_number']) ?></td>
+                                            <td class="hide-mobile"><?= e($r['course']) ?></td>
+                                            <td class="hide-mobile"><?= e($r['year_level']) ?></td>
+                                            <td class="text-muted text-sm"><?= date('M j, Y g:i A', strtotime($r['scanned_at'])) ?></td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                </div>
+            <?php endforeach; ?>
+            </div>
+        <?php endif; ?>
+    </div>
+
+    <script>
+    function toggleCollapsible(id) {
+        const el = document.getElementById(id);
+        const arrow = document.getElementById('arrow-' + id);
+        const isOpen = el.classList.contains('open');
+        el.classList.toggle('open');
+        if (arrow) arrow.textContent = isOpen ? '▸' : '▾';
+    }
+    </script>
+    <?php
+}
+?>
